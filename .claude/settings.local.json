@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:data.gov.il)",
+      "WebFetch(domain:ims.gov.il)",
+      "Bash(python3 postprocess_model.py train)",
+      "Bash(python postprocess_model.py train)",
+      "Bash(python:*)"
+    ]
+  }
+}
