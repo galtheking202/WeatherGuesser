@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WeatherGuesser — LLBG</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0e1117;
+      color: #e8eaf0;
+      font-family: system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: #fff;
+    }
+
+    /* ---- Header bar ---------------------------------------------------- */
+    .header {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+    .header-sub {
+      font-size: 0.82rem;
+      color: #777;
+    }
+    #status {
+      margin-left: auto;
+      font-size: 0.78rem;
+      padding: 3px 10px;
+      border-radius: 12px;
+    }
+    .status.ok      { background: #0d2a1a; color: #00C864; }
+    .status.fetching{ background: #1a1f2e; color: #7090ff; }
+    .status.error   { background: #2a0d0d; color: #ff5555; }
+
+    /* ---- Obs error banner ----------------------------------------------- */
+    #obs-err {
+      background: #2a0d0d;
+      color: #ff7070;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      margin-bottom: 14px;
+    }
+
+    /* ---- Metric row ---------------------------------------------------- */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .metric-card {
+      background: #161b27;
+      border: 1px solid #1e2230;
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .metric-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #666;
+      margin-bottom: 6px;
+    }
+    .metric-value {
+      font-size: 1.45rem;
+      font-weight: 600;
+      color: #fff;
+      line-height: 1.1;
+    }
+    .metric-sub {
+      font-size: 0.78rem;
+      color: #888;
+      margin-top: 4px;
+    }
+    .trend-label.rising  { color: #ff6b35; }
+    .trend-label.falling { color: #4A90D9; }
+    .trend-label.steady  { color: #aaa; }
+
+    /* ---- Model cards ---------------------------------------------------- */
+    .models {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 640px) { .models { grid-template-columns: 1fr; } }
+
+    .model-card {
+      background: #161b27;
+      border: 1px solid #1e2230;
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    .model-title {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      color: #666;
+      margin-bottom: 14px;
+    }
+    .model-mu {
+      font-size: 2.4rem;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+    .card-lstm .model-mu { color: #00C864; }
+    .card-mos  .model-mu { color: #FF7020; }
+
+    .model-pi    { font-size: 0.88rem; color: #aaa; margin-bottom: 6px; }
+    .model-sigma { font-size: 0.82rem; color: #666; margin-bottom: 10px; }
+    .model-info  { font-size: 0.78rem; color: #555; }
+    .model-wait  { font-size: 0.88rem; color: #666; font-style: italic; }
+
+    .conf-badge {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-right: 8px;
+    }
+    .conf-high { background: #0d2a1a; color: #00C864; }
+    .conf-med  { background: #2a1f0d; color: #FFAA30; }
+    .conf-low  { background: #2a0d0d; color: #ff5555; }
+    .mos-bias    { font-size: 0.82rem; color: #666; margin-top: 6px; }
+    .mos-reasons { font-size: 0.78rem; color: #555; margin-top: 4px; }
+
+    /* ---- Chart ---------------------------------------------------------- */
+    .chart-wrap {
+      background: #161b27;
+      border: 1px solid #1e2230;
+      border-radius: 10px;
+      padding: 4px;
+      margin-bottom: 24px;
+    }
+    #chart {
+      display: block;
+      width: 100%;
+      height: 320px;
+      border-radius: 8px;
+    }
+
+    /* ---- Footer --------------------------------------------------------- */
+    footer {
+      font-size: 0.74rem;
+      color: #444;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>WeatherGuesser — LLBG</h1>
+    <span class="header-sub">Last obs: <strong id="obs-time">--:--</strong> &nbsp;|&nbsp; Updated: <strong id="server-time">--:--:--</strong></span>
+    <span id="status" class="status fetching">Connecting…</span>
+  </div>
+
+  <div id="obs-err" style="display:none"></div>
+
+  <div class="metrics">
+    <div class="metric-card">
+      <div class="metric-label">Temperature</div>
+      <div class="metric-value" id="temp">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Dew Point</div>
+      <div class="metric-value" id="dewpt">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Wind</div>
+      <div class="metric-value" id="wind">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Trend</div>
+      <div class="metric-value trend-label" id="trend">—</div>
+      <div class="metric-sub" id="trend-delta"></div>
+    </div>
+  </div>
+
+  <div class="models">
+    <div class="model-card card-lstm">
+      <div class="model-title">LSTM — continuous stream</div>
+      <div id="lstm-body">
+        <div class="model-mu" id="lstm-mu"></div>
+        <div class="model-pi"><span style="color:#555">95% PI:</span> <span id="lstm-pi"></span></div>
+        <div class="model-sigma" id="lstm-sigma"></div>
+        <div class="model-info" id="lstm-info"></div>
+      </div>
+      <div class="model-wait" id="lstm-wait">Waiting for observations…</div>
+    </div>
+
+    <div class="model-card card-mos">
+      <div class="model-title">MOS — NWP post-processing</div>
+      <div id="mos-body">
+        <div class="model-mu" id="mos-mu"></div>
+        <div class="model-pi"><span style="color:#555">95% PI:</span> <span id="mos-pi"></span></div>
+        <div class="model-sigma">
+          <span class="conf-badge" id="mos-conf"></span>
+          <span class="mos-bias" id="mos-bias"></span>
+        </div>
+        <div class="mos-reasons" id="mos-reasons"></div>
+      </div>
+      <div class="model-wait" id="mos-wait">Waiting for 12:00 station reading + NWP data…</div>
+    </div>
+  </div>
+
+  <div class="chart-wrap">
+    <canvas id="chart"></canvas>
+  </div>
+
+  <footer>
+    NWS Synoptic (LLBG) polled every 3 min &nbsp;·&nbsp; NWP refreshed every 6 h &nbsp;·&nbsp; UI polls every 60 s
+  </footer>
+
+  <script src="/assets/main.js"></script>
+</body>
+</html>

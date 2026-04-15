@@ -55,12 +55,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 # -- Constants -----------------------------------------------------------------
-LAT, LON     = 32.0073, 34.8138          # Beit Dagan
+LAT, LON     = 32.0114, 34.8867          # LLBG - Ben Gurion Airport
 BASE_DIR     = Path(__file__).parent
-TRAINING_DATA_DIR = BASE_DIR / "training_data"   # per-season station files
+TRAINING_DATA_DIR = BASE_DIR / "training_data_synoptic_model"
 NWP_CACHE    = BASE_DIR / "nwp_cache.json"
 MODEL_SAVE   = BASE_DIR / "mos_model.pt"
-NWP_START    = "2022-03-01"   # earliest training data
+NWP_START    = "2018-10-01"   # earliest training data (Synoptic CSV starts 2018-10-26)
 NWP_END      = "2026-04-13"   # ERA5 archive available up to this date
 
 TRAIN_RATIO  = 0.70   # of data before calibration split
@@ -68,15 +68,15 @@ VAL_RATIO    = 0.15   # of data before calibration split
 CALIB_RATIO  = 0.15   # always the chronological tail (no leakage)
 
 FEATURE_NAMES = [
-    # Station observations (available by 10:00)
-    "t10", "rise", "rh10", "ws10", "wd_east", "accel", "is_sharav", "rh_stdev",
+    # Station observations (available by 12:00)
+    "t12", "rise", "rh12", "ws12", "wd_east", "accel", "is_sharav", "rh_stdev",
     # NWP forecast fields
-    "nwp_t10", "nwp_tmax",
+    "nwp_t12", "nwp_tmax",
     "nwp_cloud_peak_mean", "nwp_cloud_peak_std",
     "nwp_cloud_low_noon", "nwp_ws_peak",
     "nwp_pressure_trend", "nwp_precip", "nwp_wd_east",
     # Engineered
-    "bias_t10",           # station_t10  nwp_t10 (realised error signal)
+    "bias_t12",           # station_t12 - nwp_t12 (realised error signal)
     "month", "doy_sin", "doy_cos",
 ]
 N_FEATURES = len(FEATURE_NAMES)   # 21
@@ -88,7 +88,7 @@ N_FEATURES = len(FEATURE_NAMES)   # 21
 
 def _omf(url: str, params: dict) -> dict:
     """Call Open-Meteo and return JSON, with a helpful error on failure."""
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(url, params=params, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"Open-Meteo returned {r.status_code}: {r.text[:200]}")
     return r.json()
@@ -132,48 +132,89 @@ def fetch_forecast_today(target_date: str) -> dict:
     })
 
 
+def _fetch_with_retry(s: str, e: str, max_retries: int = 5) -> dict:
+    """Fetch one ERA5 chunk with exponential backoff on network errors."""
+    import time
+    delay = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fetch_era5_archive(s, e)
+        except Exception as exc:
+            if attempt == max_retries:
+                raise
+            print(f"  error ({exc.__class__.__name__}), retry {attempt}/{max_retries-1} in {delay}s ...")
+            time.sleep(delay)
+            delay *= 2
+
+
+def _merge_nwp(base: dict, chunk: dict) -> dict:
+    for var in base["hourly"]:
+        base["hourly"][var] += chunk["hourly"].get(var, [])
+    for var in base.get("daily", {}):
+        base["daily"][var] += chunk.get("daily", {}).get(var, [])
+    return base
+
+
 def load_or_fetch_nwp() -> dict:
     """
     Return cached NWP data or fetch it in annual chunks and cache.
-    Fetching 4+ years of hourly data in one request exceeds server limits,
-    so we request one calendar year at a time and merge the results.
+    Saves a partial cache after each chunk so a restart resumes from where
+    it left off rather than re-fetching already-downloaded years.
     """
+    import time
+
+    PARTIAL = NWP_CACHE.with_suffix(".partial.json")
+
+    # Full cache already present
     if NWP_CACHE.exists():
         with open(NWP_CACHE) as f:
             return json.load(f)
 
-    # Build list of (start, end) pairs, one per year
-    from datetime import date as _date
+    # Resume from partial cache if one exists
+    merged = None
+    done_chunks: set[str] = set()
+    if PARTIAL.exists():
+        with open(PARTIAL) as f:
+            saved = json.load(f)
+        merged = saved["data"]
+        done_chunks = set(saved["done"])
+        print(f"  Resuming from partial cache ({len(done_chunks)} chunks already done)")
+
     start_year = int(NWP_START[:4])
     end_year   = int(NWP_END[:4])
     chunks = []
     for yr in range(start_year, end_year + 1):
-        s = f"{yr}-03-01"
-        e = f"{yr}-06-30"
-        # Clamp to NWP_START / NWP_END
+        s = f"{yr}-01-01"
+        e = f"{yr}-12-31"
         if s < NWP_START: s = NWP_START
         if e > NWP_END:   e = NWP_END
         if s <= e:
             chunks.append((s, e))
 
     print(f"Fetching ERA5 in {len(chunks)} chunks: {chunks[0][0]} -> {chunks[-1][1]} ...")
-    merged = None
     for s, e in chunks:
+        key = f"{s}/{e}"
+        if key in done_chunks:
+            print(f"  chunk {s} -> {e} ... (cached)")
+            continue
+
         print(f"  chunk {s} -> {e} ...", end=" ", flush=True)
-        chunk = fetch_era5_archive(s, e)
+        chunk = _fetch_with_retry(s, e)
         print("ok")
-        if merged is None:
-            merged = chunk
-        else:
-            # Append hourly time-series arrays
-            for var in merged["hourly"]:
-                merged["hourly"][var] += chunk["hourly"][var]
-            # Append daily arrays
-            for var in merged.get("daily", {}):
-                merged["daily"][var] += chunk["daily"][var]
+
+        merged = chunk if merged is None else _merge_nwp(merged, chunk)
+        done_chunks.add(key)
+
+        # Save partial progress
+        with open(PARTIAL, "w") as f:
+            json.dump({"done": list(done_chunks), "data": merged}, f)
+
+        # Brief pause to avoid rate-limiting on consecutive requests
+        time.sleep(3)
 
     with open(NWP_CACHE, "w") as f:
         json.dump(merged, f)
+    PARTIAL.unlink(missing_ok=True)
     print(f"  Cached to {NWP_CACHE.name}")
     return merged
 
@@ -226,21 +267,21 @@ def nwp_features_from_response(raw: dict) -> dict[str, dict]:
         cloud_low  = [hours[h]["cloudcover_low"] for h in range(11, 16) if "cloudcover_low" in hours.get(h, {})]
         ws_peak    = [hours[h]["windspeed_10m"]  for h in range(11, 16) if "windspeed_10m"  in hours.get(h, {})]
 
-        # Pressure trend 06->10: falling = approaching front
+        # Pressure trend 06->12: falling = approaching front
         p6  = at(6,  "surface_pressure")
-        p10 = at(10, "surface_pressure")
-        ptrd = (p10 - p6) if (p6 and p10) else 0.0
+        p12 = at(12, "surface_pressure")
+        ptrd = (p12 - p6) if (p6 and p12) else 0.0
 
-        wd10 = at(10, "winddirection_10m")
-        wd_east = math.sin(math.radians(wd10)) if wd10 is not None else 0.0
+        wd12 = at(12, "winddirection_10m")
+        wd_east = math.sin(math.radians(wd12)) if wd12 is not None else 0.0
 
-        nwp_t10 = at(10, "temperature_2m")
-        if nwp_t10 is None:
+        nwp_t12 = at(12, "temperature_2m")
+        if nwp_t12 is None:
             continue
 
         dday = daily_idx.get(ds, {})
         result[ds] = {
-            "nwp_t10":             nwp_t10,
+            "nwp_t12":             nwp_t12,
             "nwp_tmax":            dday.get("temperature_2m_max"),
             "nwp_cloud_peak_mean": _safe_avg(cloud_peak),
             "nwp_cloud_peak_std":  _safe_std(cloud_peak),   # key uncertainty driver
@@ -257,49 +298,84 @@ def nwp_features_from_response(raw: dict) -> dict[str, dict]:
 # 3.  STATION FEATURE EXTRACTION
 # ===========================================================================
 
-def load_station() -> dict[date, list]:
+def _rh_from_t_td(t: float, td: float) -> float:
+    """Relative humidity (%) from air temp and dew point (both °C), Magnus formula."""
+    a, b = 17.625, 243.04
+    return 100.0 * math.exp(a * td / (b + td)) / math.exp(a * t / (b + t))
+
+
+def load_station(extra_file: str | None = None) -> dict[date, list]:
     """
-    Load all station JSON files from the training_data/ directory.
-    Each file is expected to have records with keys: date, TD, RH, WD, WS.
+    Load all station CSV files from training_data_synoptic_model/.
+    Expected columns (Synoptic export format):
+        Date_Time, air_temp_set_1, dew_point_temperature_set_1,
+        wind_speed_set_1, wind_direction_set_1
+    RH is computed from air temp and dew point via the Magnus formula.
     """
     records = []
-    files = sorted(TRAINING_DATA_DIR.glob("*.json"))
-    if not files:
+    files = sorted(TRAINING_DATA_DIR.glob("*.csv"))
+    if not files and not extra_file:
         raise FileNotFoundError(
-            f"No JSON files found in {TRAINING_DATA_DIR}. "
-            "Place station data files there before training."
+            f"No CSV files found in {TRAINING_DATA_DIR}. "
+            "Place Synoptic station export files there before training."
         )
-    for path in files:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+
+    all_paths = [(p, p.name) for p in files]
+    if extra_file:
+        all_paths.append((Path(extra_file), Path(extra_file).name))
+
+    for path, name in all_paths:
         loaded = 0
-        for d in data:
+        with open(path, encoding="utf-8") as f:
+            # Skip comment lines starting with '#'
+            lines = [l for l in f if not l.startswith("#")]
+
+        # Parse header — row 0 is column names, row 1 is units (skip it)
+        headers = [h.strip() for h in lines[0].split(",")]
+        for raw in lines[2:]:           # skip header + units row
+            cols = raw.strip().split(",")
+            if len(cols) < len(headers):
+                continue
+            row = dict(zip(headers, cols))
             try:
-                records.append({
-                    "dt": datetime.strptime(d["date"], "%d/%m/%Y %H:%M"),
-                    "TD": float(d["TD"]), "RH": float(d["RH"]),
-                    "WD": float(d["WD"]), "WS": float(d["WS"]),
-                })
+                dt_str = row["Date_Time"].strip()
+                # Normalise offset: +0300 -> +03:00 for fromisoformat
+                if len(dt_str) > 5 and dt_str[-5] in ('+', '-') and ':' not in dt_str[-5:]:
+                    dt_str = dt_str[:-2] + ":" + dt_str[-2:]
+                dt = datetime.fromisoformat(dt_str).replace(tzinfo=None)
+
+                t  = float(row["air_temp_set_1"])
+                td = float(row.get("dew_point_temperature_set_1") or
+                           row.get("dew_point_temperature_set_1d", "nan"))
+                wd_raw = row.get("wind_direction_set_1", "").strip()
+                wd = float(wd_raw) if wd_raw else 0.0
+                ws = float(row["wind_speed_set_1"])
+                rh = _rh_from_t_td(t, td)
+
+                records.append({"dt": dt, "TD": t, "RH": rh, "WD": wd, "WS": ws})
                 loaded += 1
-            except: pass
-        print(f"  Loaded {loaded:5d} records from {path.name}")
+            except (ValueError, KeyError):
+                pass
+        print(f"  Loaded {loaded:5d} records from {name}")
+
     by_date = defaultdict(list)
     for r in records:
         by_date[r["dt"].date()].append(r)
     return by_date
 
 
-def station_morning_features(recs: list) -> dict | None:
+def station_morning_features(recs: list, require_after_cut: bool = True) -> dict | None:
     """
-    Extract all features available by 10:00 AM from station records.
+    Extract all features available by 12:00 from station records.
     Returns None if data is insufficient.
+    require_after_cut: set False when predicting (no post-12:00 data yet).
     """
     recs = sorted(recs, key=lambda x: x["dt"])
-    until10 = [r for r in recs
-               if r["dt"].hour < 10 or (r["dt"].hour == 10 and r["dt"].minute == 0)]
-    after10  = [r for r in recs
-                if r["dt"].hour > 10 or (r["dt"].hour == 10 and r["dt"].minute > 0)]
-    if len(until10) < 5 or len(after10) < 3:
+    until12 = [r for r in recs
+               if r["dt"].hour < 12 or (r["dt"].hour == 12 and r["dt"].minute == 0)]
+    after12  = [r for r in recs
+                if r["dt"].hour > 12 or (r["dt"].hour == 12 and r["dt"].minute > 0)]
+    if len(until12) < 5 or (require_after_cut and len(after12) < 3):
         return None
 
     def avg(lst): return sum(lst) / len(lst) if lst else None
@@ -308,24 +384,24 @@ def station_morning_features(recs: list) -> dict | None:
     if t6 is None:
         return None
 
-    last = until10[-1]
-    t10, rh10, wd10, ws10 = last["TD"], last["RH"], last["WD"], last["WS"]
+    last = until12[-1]
+    t12, rh12, wd12, ws12 = last["TD"], last["RH"], last["WD"], last["WS"]
 
     # Heating acceleration: linear slope of last 6 readings
-    l6 = until10[-6:]
+    l6 = until12[-6:]
     xs, ys = list(range(len(l6))), [r["TD"] for r in l6]
     mx, my = avg(xs), avg(ys)
     denom  = sum((x - mx) ** 2 for x in xs)
     accel  = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom if denom else 0.0
 
-    wd_east   = math.sin(math.radians(wd10))
-    is_sharav = 1.0 if (45 <= wd10 <= 200 and rh10 < 50) else 0.0
-    rh_vals   = [r["RH"] for r in until10[-6:]]
+    wd_east   = math.sin(math.radians(wd12))
+    is_sharav = 1.0 if (45 <= wd12 <= 200 and rh12 < 50) else 0.0
+    rh_vals   = [r["RH"] for r in until12[-6:]]
     rh_stdev  = statistics.stdev(rh_vals) if len(rh_vals) > 1 else 0.0
 
     return {
-        "t10": t10, "rise": t10 - t6,
-        "rh10": rh10, "ws10": ws10, "wd_east": wd_east,
+        "t12": t12, "rise": t12 - t6,
+        "rh12": rh12, "ws12": ws12, "wd_east": wd_east,
         "accel": accel, "is_sharav": is_sharav, "rh_stdev": rh_stdev,
         "max_day": max(r["TD"] for r in recs),   # label (only for training)
     }
@@ -339,20 +415,20 @@ def build_feature_row(sf: dict, nf: dict, dt: date) -> list[float]:
     """Assemble a single feature vector (must match FEATURE_NAMES order)."""
     doy = dt.timetuple().tm_yday
     return [
-        sf["t10"],       sf["rise"],      sf["rh10"],       sf["ws10"],
+        sf["t12"],       sf["rise"],      sf["rh12"],       sf["ws12"],
         sf["wd_east"],   sf["accel"],     sf["is_sharav"],   sf["rh_stdev"],
-        nf["nwp_t10"],   nf["nwp_tmax"],
+        nf["nwp_t12"],   nf["nwp_tmax"],
         nf["nwp_cloud_peak_mean"], nf["nwp_cloud_peak_std"],
         nf["nwp_cloud_low_noon"],  nf["nwp_ws_peak"],
         nf["nwp_pressure_trend"],  nf["nwp_precip"],   nf["nwp_wd_east"],
-        sf["t10"] - nf["nwp_t10"],       # bias_t10
+        sf["t12"] - nf["nwp_t12"],       # bias_t12
         float(dt.month),
         math.sin(2 * math.pi * doy / 365),
         math.cos(2 * math.pi * doy / 365),
     ]
 
 
-TRAIN_MONTHS = {3, 4, 5, 6}   # Mar-Jun: spring + early summer (matches training_data files)
+TRAIN_MONTHS = None   # None = all months (full-year training)
 
 
 def build_dataset(months=TRAIN_MONTHS) -> tuple[list, list, list[date]]:
@@ -631,9 +707,9 @@ def predict(model: PostProcessMOS,
         date, mu, sigma, ci_low, ci_high, ci_width_95,
         confidence, reasons, [nwp/station diagnostics]
     """
-    sf = station_morning_features(station_recs)
+    sf = station_morning_features(station_recs, require_after_cut=False)
     if sf is None:
-        return {"error": "Not enough station data before 10:00"}
+        return {"error": "Not enough station data before 12:00"}
 
     nf = nwp_features
     if nf.get("nwp_tmax") is None:
@@ -654,7 +730,7 @@ def predict(model: PostProcessMOS,
     ci_low  = round(mu - ci_half, 2)
     ci_high = round(mu + ci_half, 2)
 
-    bias_t10       = sf["t10"] - nf["nwp_t10"]
+    bias_t12       = sf["t12"] - nf["nwp_t12"]
     cloud_std      = nf["nwp_cloud_peak_std"]
     precip         = nf["nwp_precip"]
     pressure_trend = nf["nwp_pressure_trend"]
@@ -680,15 +756,15 @@ def predict(model: PostProcessMOS,
         reasons.append(f"falling pressure (front signal, {pressure_trend:+.2f} hPa/4h)")
     if sf["is_sharav"]:
         reasons.append("sharav conditions")
-    if abs(bias_t10) > 2.5:
-        reasons.append(f"large NWP bias at 10:00 ({bias_t10:+.1f} C)")
+    if abs(bias_t12) > 2.5:
+        reasons.append(f"large NWP bias at 12:00 ({bias_t12:+.1f} C)")
 
     return {
         "date":           target_date.strftime("%Y-%m-%d"),
-        "temp_at_10:00":  round(sf["t10"], 1),
+        "temp_at_12:00":  round(sf["t12"], 1),
         "nwp_tmax":       round(nf["nwp_tmax"], 1),
-        "nwp_t10":        round(nf["nwp_t10"], 1),
-        "nwp_bias_at_10": round(bias_t10, 2),
+        "nwp_t12":        round(nf["nwp_t12"], 1),
+        "nwp_bias_at_12": round(bias_t12, 2),
         "nwp_cloud_std":  round(cloud_std, 1),
         "mu":             round(mu),  # integer prediction (23.2 -> 23)
         "sigma":          round(sigma, 3),
@@ -823,7 +899,7 @@ def cmd_train():
     save_model(model, scaler_mean, scaler_std, q)
 
 
-def cmd_predict(date_str: str | None = None):
+def cmd_predict(date_str: str | None = None, station_file: str | None = None):
     model, s_mean, s_std, q = load_model()
 
     # Determine target date
@@ -839,12 +915,12 @@ def cmd_predict(date_str: str | None = None):
     print(f"\nPredicting for {target_iso} ")
 
     # Load station data
-    station = load_station()
+    station = load_station(extra_file=station_file)
     if target not in station:
         if target > date.today():
             sys.exit(
                 f"Cannot predict {target_iso}: this model requires station readings "
-                f"up to 10:00 AM on the target day. Run again after 10:00 AM on that date."
+                f"up to 12:00 on the target day. Run again after 12:00 on that date."
             )
         sys.exit(
             f"No station data found for {target_iso}. "
@@ -878,10 +954,10 @@ def cmd_predict(date_str: str | None = None):
     conf_sym = {"HIGH": "***", "MEDIUM": "**", "LOW": "!"}[result["confidence"]]
     print(f"\n{'='*52}")
     print(f"  Date              : {result['date']}")
-    print(f"  Station at 10:00  : {result['temp_at_10:00']} C")
+    print(f"  Station at 12:00  : {result['temp_at_12:00']} C")
     print(f"  NWP forecast max  : {result['nwp_tmax']} C")
-    print(f"  NWP at 10:00      : {result['nwp_t10']} C")
-    print(f"  NWP bias at 10:00 : {result['nwp_bias_at_10']:+.2f} C")
+    print(f"  NWP at 12:00      : {result['nwp_t12']} C")
+    print(f"  NWP bias at 12:00 : {result['nwp_bias_at_12']:+.2f} C")
     print(f"  NWP cloud variab. : {result['nwp_cloud_std']:.1f}%")
     print(f"{'='*52}")
     print(f"  Predicted max (mu): {result['mu']} C")
@@ -973,7 +1049,8 @@ def cmd_backtest():
     print(f"  Within +-1 C     : {within1}/{total} = {within1/total*100:.0f}%")
     print(f"  95% PI covered   : {covered}/{total} = {covered/total*100:.0f}%")
     print(f"\n  By month:")
-    month_names = {3:"Mar", 4:"Apr", 5:"May", 6:"Jun"}
+    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                   7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
     for m in sorted(month_stats):
         ms = month_stats[m]
         mae = sum(ms["errs"]) / len(ms["errs"])
@@ -989,7 +1066,19 @@ def main():
     if cmd == "train":
         cmd_train()
     elif cmd == "predict":
-        cmd_predict(sys.argv[2] if len(sys.argv) > 2 else None)
+        # Usage: predict [YYYY-MM-DD] [--station path/to/file.json]
+        args = sys.argv[2:]
+        date_str = None
+        station_file = None
+        i = 0
+        while i < len(args):
+            if args[i] == "--station" and i + 1 < len(args):
+                station_file = args[i + 1]
+                i += 2
+            else:
+                date_str = args[i]
+                i += 1
+        cmd_predict(date_str, station_file)
     elif cmd == "evaluate":
         cmd_evaluate()
     elif cmd == "backtest":

@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# large data / model artifacts
+nwp_cache.json
+training_data_synoptic_model/
+training_data/
+
+# frontend build output & deps
+frontend/node_modules/
+frontend/dist/
+
+# misc
+image.png
+*.log
