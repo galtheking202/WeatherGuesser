@@ -45,7 +45,7 @@ from train_nws_model import DEVICE, load_model as load_nws_model, obs_to_feature
 STID         = "LLBG"
 NWS_TOKEN    = os.environ["NWS_TOKEN"]
 SYNOPTIC_URL = "https://api.synopticdata.com/v2/stations/timeseries"
-OBS_TTL      = 180       # seconds — NWS API cache
+OBS_TTL      = 60        # seconds — NWS API cache
 NWP_TTL      = 6 * 3600  # seconds — NWP cache
 PORT         = 8000
 STATIC_DIR   = Path(__file__).parent / "frontend" / "dist"
