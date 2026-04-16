@@ -42,6 +42,7 @@ interface ApiData {
   nws_recs: ObsRec[];
   lstm: LstmResult | null;
   mos: MosResult | null;
+  mos_cutoff: string | null;
 }
 
 // ---- DOM refs -------------------------------------------------------------
@@ -63,12 +64,13 @@ const elLstmSigma   = $("lstm-sigma");
 const elLstmInfo    = $("lstm-info");
 const elLstmWait    = $("lstm-wait");
 
-const elMosMu       = $("mos-mu");
-const elMosPi       = $("mos-pi");
-const elMosConf     = $("mos-conf");
-const elMosBias     = $("mos-bias");
-const elMosReasons  = $("mos-reasons");
-const elMosWait     = $("mos-wait");
+const elMosMu          = $("mos-mu");
+const elMosPi          = $("mos-pi");
+const elMosConf        = $("mos-conf");
+const elMosBias        = $("mos-bias");
+const elMosReasons     = $("mos-reasons");
+const elMosWait        = $("mos-wait");
+const elMosCutoffLabel = $("mos-cutoff-label");
 
 const elStatus      = $("status");
 const canvas        = $<HTMLCanvasElement>("chart");
@@ -141,10 +143,11 @@ function renderLstm(lstm: LstmResult | null) {
   elLstmInfo.textContent  = `${lstm.n_obs} obs  ·  last at ${lstm.last_dt}`;
 }
 
-function renderMos(mos: MosResult | null) {
+function renderMos(mos: MosResult | null, cutoff: string | null) {
+  elMosCutoffLabel.textContent = cutoff ? `[cutoff ${cutoff}]` : "";
   if (!mos || "error" in mos) {
     hide(elMosMu.parentElement!);
-    elMosWait.textContent = mos?.error ?? "Waiting for 12:00 station reading + NWP data…";
+    elMosWait.textContent = mos?.error ?? "Waiting for observations + NWP data…";
     show(elMosWait);
     return;
   }
@@ -290,7 +293,7 @@ async function update() {
 
   renderHeader(d);
   renderLstm(d.lstm);
-  renderMos(d.mos);
+  renderMos(d.mos, d.mos_cutoff);
   drawChart(d.nws_recs, d.lstm, d.mos);
   setStatus(`Updated at ${d.server_time}`, "ok");
 }

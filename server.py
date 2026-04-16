@@ -36,6 +36,9 @@ from postprocess_model import (
     load_model as load_mos_model,
     nwp_features_from_response,
     predict as mos_predict,
+    CUTOFFS,
+    cutoff_tag,
+    model_path_for,
 )
 from train_nws_model import DEVICE, load_model as load_nws_model, obs_to_features
 
@@ -56,9 +59,16 @@ app = FastAPI(title="WeatherGuesser")
 # Model loading (once at startup)
 # ---------------------------------------------------------------------------
 print("Loading models...")
-mos_bundle = load_mos_model()
+mos_bundles: dict = {}
+for _h, _m in CUTOFFS:
+    _path = model_path_for(_h, _m)
+    if _path.exists():
+        mos_bundles[(_h, _m)] = load_mos_model(path=str(_path))
+        print(f"  mos_model_{cutoff_tag(_h, _m)} loaded")
+    else:
+        print(f"  mos_model_{cutoff_tag(_h, _m)} NOT FOUND — run: python postprocess_model.py train")
 nws_bundle = load_nws_model()
-print(f"  mos_model loaded | nws_model loaded | device={DEVICE}")
+print(f"  nws_model loaded | device={DEVICE}")
 
 # ---------------------------------------------------------------------------
 # Simple TTL cache (thread-safe)
@@ -152,8 +162,7 @@ def _fetch_obs_now(today_str: str):
 
 def _fetch_nwp_now(today_str: str):
     try:
-        raw = fetch_forecast_today(today_str)
-        return nwp_features_from_response(raw), None
+        return fetch_forecast_today(today_str), None
     except Exception as e:
         return {}, str(e)
 
@@ -176,26 +185,35 @@ def _run_nws(nws_recs_raw: list) -> dict | None:
     mu    = mu_t[0, -1].item()
     sigma = ls_t[0, -1].exp().item()
     ci    = q * sigma
+    # Daily max can't be below what's already been observed today
+    obs_max = max(r["t"] for r in recs)
+    mu      = max(mu, obs_max)
+    ci_low  = max(mu - ci, obs_max)
+    ci_high = max(mu + ci, obs_max)
     return {
         "mu":      round(mu, 1),
         "sigma":   round(sigma, 3),
-        "ci_low":  round(mu - ci, 1),
-        "ci_high": round(mu + ci, 1),
+        "ci_low":  round(ci_low, 1),
+        "ci_high": round(ci_high, 1),
         "n_obs":   len(recs),
         "last_t":  recs[-1]["t"],
         "last_dt": recs[-1]["dt"].strftime("%H:%M"),
     }
 
 
-def _run_mos(mos_recs_raw: list, nwp_daily: dict, today: date) -> dict | None:
+def _run_mos(mos_recs_raw: list, nwp_raw: dict, today: date, cutoff: tuple) -> dict | None:
     if not mos_recs_raw:
         return None
+    if cutoff not in mos_bundles:
+        return {"error": f"MOS model {cutoff[0]:02d}:{cutoff[1]:02d} not loaded — run training first"}
+    ch, cm = cutoff
+    nwp_daily = nwp_features_from_response(nwp_raw, cutoff_hour=ch)
     ds = today.strftime("%Y-%m-%d")
     if ds not in nwp_daily:
         return {"error": "NWP data not available"}
     recs = [{**r, "dt": datetime.fromisoformat(r["dt"])} for r in mos_recs_raw]
-    model, s_mean, s_std, q = mos_bundle
-    return mos_predict(model, s_mean, s_std, q, recs, nwp_daily[ds], today)
+    model, s_mean, s_std, q, _ = mos_bundles[cutoff]
+    return mos_predict(model, s_mean, s_std, q, recs, nwp_daily[ds], today, cutoff=cutoff)
 
 
 # ---------------------------------------------------------------------------
@@ -208,14 +226,19 @@ def get_data():
     now       = datetime.now()
 
     obs_data, obs_err = _cached("obs", OBS_TTL, lambda: _fetch_obs_now(today_str))
-    nwp_data, nwp_err = _cached("nwp", NWP_TTL, lambda: _fetch_nwp_now(today_str))
+    nwp_raw,  nwp_err = _cached("nwp", NWP_TTL, lambda: _fetch_nwp_now(today_str))
 
     mos_recs = obs_data.get("mos_recs", [])
     nws_recs = obs_data.get("nws_recs", [])
 
+    # Pick the MOS model whose cutoff is <= current local time
+    current_hm = (now.hour, now.minute)
+    valid_cutoffs = [(h, m) for h, m in CUTOFFS if (h, m) <= current_hm]
+    cutoff = max(valid_cutoffs) if valid_cutoffs else CUTOFFS[-1]
+
     nws_res = _run_nws(nws_recs)
     try:
-        mos_res = _run_mos(mos_recs, nwp_data, today)
+        mos_res = _run_mos(mos_recs, nwp_raw, today, cutoff=cutoff)
     except Exception as e:
         mos_res = {"error": str(e)}
 
@@ -227,15 +250,16 @@ def get_data():
         trend = {"delta": round(delta, 1), "label": "Rising" if delta > 0 else ("Falling" if delta < 0 else "Steady")}
 
     return {
-        "server_time": now.strftime("%H:%M:%S"),
-        "today":       today_str,
-        "obs_err":     obs_err,
-        "nwp_err":     nwp_err,
-        "current":     current,
-        "trend":       trend,
-        "nws_recs":    nws_recs,
-        "lstm":        nws_res,
-        "mos":         mos_res,
+        "server_time":  now.strftime("%H:%M:%S"),
+        "today":        today_str,
+        "obs_err":      obs_err,
+        "nwp_err":      nwp_err,
+        "current":      current,
+        "trend":        trend,
+        "nws_recs":     nws_recs,
+        "lstm":         nws_res,
+        "mos":          mos_res,
+        "mos_cutoff":   f"{cutoff[0]:02d}:{cutoff[1]:02d}",
     }
 
 

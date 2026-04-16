@@ -67,16 +67,32 @@ TRAIN_RATIO  = 0.70   # of data before calibration split
 VAL_RATIO    = 0.15   # of data before calibration split
 CALIB_RATIO  = 0.15   # always the chronological tail (no leakage)
 
+# ---------------------------------------------------------------------------
+# Cutoff schedule — 10 models, 13:50 → 10:50 in 20-min steps
+# ---------------------------------------------------------------------------
+CUTOFFS: list[tuple[int, int]] = [
+    (13, 50), (13, 30), (13, 10),
+    (12, 50), (12, 30), (12, 10),
+    (11, 50), (11, 30), (11, 10),
+    (10, 50),
+]
+
+def cutoff_tag(h: int, m: int) -> str:
+    return f"{h:02d}{m:02d}"
+
+def model_path_for(h: int, m: int) -> Path:
+    return BASE_DIR / f"mos_model_{cutoff_tag(h, m)}.pt"
+
 FEATURE_NAMES = [
-    # Station observations (available by 12:00)
-    "t12", "rise", "rh12", "ws12", "wd_east", "accel", "is_sharav", "rh_stdev",
+    # Station observations (available by cutoff time)
+    "t_cut", "rise", "rh_cut", "ws_cut", "wd_east", "accel", "is_sharav", "rh_stdev",
     # NWP forecast fields
-    "nwp_t12", "nwp_tmax",
+    "nwp_t_cut", "nwp_tmax",
     "nwp_cloud_peak_mean", "nwp_cloud_peak_std",
     "nwp_cloud_low_noon", "nwp_ws_peak",
     "nwp_pressure_trend", "nwp_precip", "nwp_wd_east",
     # Engineered
-    "bias_t12",           # station_t12 - nwp_t12 (realised error signal)
+    "bias_t_cut",         # station_t_cut - nwp_t_cut (realised error signal)
     "month", "doy_sin", "doy_cos",
 ]
 N_FEATURES = len(FEATURE_NAMES)   # 21
@@ -230,7 +246,7 @@ def _safe_std(vals):
     return statistics.stdev(vals) if len(vals) > 1 else 0.0
 
 
-def nwp_features_from_response(raw: dict) -> dict[str, dict]:
+def nwp_features_from_response(raw: dict, cutoff_hour: int = 12) -> dict[str, dict]:
     """
     Parse an Open-Meteo response -> {date_iso: {feature: value}}.
     Works for both the archive and forecast endpoints.
@@ -272,16 +288,16 @@ def nwp_features_from_response(raw: dict) -> dict[str, dict]:
         p12 = at(12, "surface_pressure")
         ptrd = (p12 - p6) if (p6 and p12) else 0.0
 
-        wd12 = at(12, "winddirection_10m")
-        wd_east = math.sin(math.radians(wd12)) if wd12 is not None else 0.0
+        wd_cut = at(cutoff_hour, "winddirection_10m")
+        wd_east = math.sin(math.radians(wd_cut)) if wd_cut is not None else 0.0
 
-        nwp_t12 = at(12, "temperature_2m")
-        if nwp_t12 is None:
+        nwp_t_cut = at(cutoff_hour, "temperature_2m")
+        if nwp_t_cut is None:
             continue
 
         dday = daily_idx.get(ds, {})
         result[ds] = {
-            "nwp_t12":             nwp_t12,
+            "nwp_t_cut":           nwp_t_cut,
             "nwp_tmax":            dday.get("temperature_2m_max"),
             "nwp_cloud_peak_mean": _safe_avg(cloud_peak),
             "nwp_cloud_peak_std":  _safe_std(cloud_peak),   # key uncertainty driver
@@ -364,18 +380,19 @@ def load_station(extra_file: str | None = None) -> dict[date, list]:
     return by_date
 
 
-def station_morning_features(recs: list, require_after_cut: bool = True) -> dict | None:
+def station_morning_features(recs: list, cutoff: tuple = (12, 0), require_after_cut: bool = True) -> dict | None:
     """
-    Extract all features available by 12:00 from station records.
-    Returns None if data is insufficient.
-    require_after_cut: set False when predicting (no post-12:00 data yet).
+    Extract features available up to the cutoff time from station records.
+    cutoff: (hour, minute) — observations at or before this time are used.
+    require_after_cut: set False when predicting (no post-cutoff data yet).
     """
+    ch, cm = cutoff
     recs = sorted(recs, key=lambda x: x["dt"])
-    until12 = [r for r in recs
-               if r["dt"].hour < 12 or (r["dt"].hour == 12 and r["dt"].minute == 0)]
-    after12  = [r for r in recs
-                if r["dt"].hour > 12 or (r["dt"].hour == 12 and r["dt"].minute > 0)]
-    if len(until12) < 5 or (require_after_cut and len(after12) < 3):
+    until_cut = [r for r in recs
+                 if (r["dt"].hour, r["dt"].minute) <= (ch, cm)]
+    after_cut  = [r for r in recs
+                  if (r["dt"].hour, r["dt"].minute) > (ch, cm)]
+    if len(until_cut) < 5 or (require_after_cut and len(after_cut) < 3):
         return None
 
     def avg(lst): return sum(lst) / len(lst) if lst else None
@@ -384,24 +401,24 @@ def station_morning_features(recs: list, require_after_cut: bool = True) -> dict
     if t6 is None:
         return None
 
-    last = until12[-1]
-    t12, rh12, wd12, ws12 = last["TD"], last["RH"], last["WD"], last["WS"]
+    last = until_cut[-1]
+    t_cut, rh_cut, wd_cut, ws_cut = last["TD"], last["RH"], last["WD"], last["WS"]
 
-    # Heating acceleration: linear slope of last 6 readings
-    l6 = until12[-6:]
+    # Heating acceleration: linear slope of last 6 readings before cutoff
+    l6 = until_cut[-6:]
     xs, ys = list(range(len(l6))), [r["TD"] for r in l6]
     mx, my = avg(xs), avg(ys)
     denom  = sum((x - mx) ** 2 for x in xs)
     accel  = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom if denom else 0.0
 
-    wd_east   = math.sin(math.radians(wd12))
-    is_sharav = 1.0 if (45 <= wd12 <= 200 and rh12 < 50) else 0.0
-    rh_vals   = [r["RH"] for r in until12[-6:]]
+    wd_east   = math.sin(math.radians(wd_cut))
+    is_sharav = 1.0 if (45 <= wd_cut <= 200 and rh_cut < 50) else 0.0
+    rh_vals   = [r["RH"] for r in until_cut[-6:]]
     rh_stdev  = statistics.stdev(rh_vals) if len(rh_vals) > 1 else 0.0
 
     return {
-        "t12": t12, "rise": t12 - t6,
-        "rh12": rh12, "ws12": ws12, "wd_east": wd_east,
+        "t_cut": t_cut, "rise": t_cut - t6,
+        "rh_cut": rh_cut, "ws_cut": ws_cut, "wd_east": wd_east,
         "accel": accel, "is_sharav": is_sharav, "rh_stdev": rh_stdev,
         "max_day": max(r["TD"] for r in recs),   # label (only for training)
     }
@@ -415,13 +432,13 @@ def build_feature_row(sf: dict, nf: dict, dt: date) -> list[float]:
     """Assemble a single feature vector (must match FEATURE_NAMES order)."""
     doy = dt.timetuple().tm_yday
     return [
-        sf["t12"],       sf["rise"],      sf["rh12"],       sf["ws12"],
+        sf["t_cut"],     sf["rise"],      sf["rh_cut"],      sf["ws_cut"],
         sf["wd_east"],   sf["accel"],     sf["is_sharav"],   sf["rh_stdev"],
-        nf["nwp_t12"],   nf["nwp_tmax"],
+        nf["nwp_t_cut"], nf["nwp_tmax"],
         nf["nwp_cloud_peak_mean"], nf["nwp_cloud_peak_std"],
         nf["nwp_cloud_low_noon"],  nf["nwp_ws_peak"],
         nf["nwp_pressure_trend"],  nf["nwp_precip"],   nf["nwp_wd_east"],
-        sf["t12"] - nf["nwp_t12"],       # bias_t12
+        sf["t_cut"] - nf["nwp_t_cut"],   # bias_t_cut
         float(dt.month),
         math.sin(2 * math.pi * doy / 365),
         math.cos(2 * math.pi * doy / 365),
@@ -431,15 +448,14 @@ def build_feature_row(sf: dict, nf: dict, dt: date) -> list[float]:
 TRAIN_MONTHS = None   # None = all months (full-year training)
 
 
-def build_dataset(months=TRAIN_MONTHS) -> tuple[list, list, list[date]]:
+def build_dataset(cutoff: tuple = (12, 0), months=TRAIN_MONTHS) -> tuple[list, list, list[date]]:
     """
     Returns (X, y, dates) -- all aligned, chronologically sorted.
-    NWP data is fetched/cached automatically.
-    Only includes days in the given months (default: Apr-Oct, when the
-    station max temperature is most relevant and NWP bias is consistent).
+    cutoff: (hour, minute) — only obs up to this time are used as features.
     """
+    ch, cm = cutoff
     nwp_raw   = load_or_fetch_nwp()
-    nwp_daily = nwp_features_from_response(nwp_raw)
+    nwp_daily = nwp_features_from_response(nwp_raw, cutoff_hour=ch)
     station   = load_station()
 
     X, y, dates_out = [], [], []
@@ -452,14 +468,14 @@ def build_dataset(months=TRAIN_MONTHS) -> tuple[list, list, list[date]]:
         nf = nwp_daily[ds]
         if nf.get("nwp_tmax") is None:
             continue
-        sf = station_morning_features(station[dt])
+        sf = station_morning_features(station[dt], cutoff=cutoff)
         if sf is None:
             continue
         X.append(build_feature_row(sf, nf, dt))
         y.append(round(sf["max_day"]))  # integer target: 23.2 -> 23
         dates_out.append(dt)
 
-    print(f"Dataset: {len(X)} days  ({dates_out[0]} -> {dates_out[-1]})  "
+    print(f"Dataset [{ch:02d}:{cm:02d}]: {len(X)} days  ({dates_out[0]} -> {dates_out[-1]})  "
           f"[months: {sorted(months) if months else 'all'}]")
     return X, y, dates_out
 
@@ -691,25 +707,28 @@ def predict(model: PostProcessMOS,
             conformal_q: float,
             station_recs: list,
             nwp_features: dict,
-            target_date: date) -> dict:
+            target_date: date,
+            cutoff: tuple = (12, 0)) -> dict:
     """
     Produce a calibrated probabilistic forecast for one day.
 
     Parameters
     ----------
-    station_recs  : raw station records for target_date (all day, up to 10:00 needed)
+    station_recs  : raw station records for target_date (all obs up to cutoff needed)
     nwp_features  : dict returned by nwp_features_from_response for that date
     target_date   : date object
+    cutoff        : (hour, minute) — which model's observation window to use
 
     Returns
     -------
     dict with keys:
-        date, mu, sigma, ci_low, ci_high, ci_width_95,
+        date, mu, sigma, ci_low_95, ci_high_95, ci_width_95,
         confidence, reasons, [nwp/station diagnostics]
     """
-    sf = station_morning_features(station_recs, require_after_cut=False)
+    ch, cm = cutoff
+    sf = station_morning_features(station_recs, cutoff=cutoff, require_after_cut=False)
     if sf is None:
-        return {"error": "Not enough station data before 12:00"}
+        return {"error": f"Not enough station data before {ch:02d}:{cm:02d}"}
 
     nf = nwp_features
     if nf.get("nwp_tmax") is None:
@@ -730,13 +749,11 @@ def predict(model: PostProcessMOS,
     ci_low  = round(mu - ci_half, 2)
     ci_high = round(mu + ci_half, 2)
 
-    bias_t12       = sf["t12"] - nf["nwp_t12"]
+    bias_t_cut     = sf["t_cut"] - nf["nwp_t_cut"]
     cloud_std      = nf["nwp_cloud_peak_std"]
     precip         = nf["nwp_precip"]
     pressure_trend = nf["nwp_pressure_trend"]
 
-    # Confidence tiers — calibrated to Mar-Jun Beit Dagan sigma distribution
-    # (model sigma typically 1.4-2.6 C depending on atmospheric stability)
     if sigma < 1.55 and cloud_std < 15.0 and precip < 0.1 and not sf["is_sharav"]:
         confidence = "HIGH"
     elif sigma < 2.0 and cloud_std < 30.0 and precip < 1.0:
@@ -744,7 +761,6 @@ def predict(model: PostProcessMOS,
     else:
         confidence = "LOW"
 
-    # Explain low confidence
     reasons = []
     if sigma >= 2.0:
         reasons.append(f"model uncertainty high (sigma={sigma:.2f} C)")
@@ -756,17 +772,18 @@ def predict(model: PostProcessMOS,
         reasons.append(f"falling pressure (front signal, {pressure_trend:+.2f} hPa/4h)")
     if sf["is_sharav"]:
         reasons.append("sharav conditions")
-    if abs(bias_t12) > 2.5:
-        reasons.append(f"large NWP bias at 12:00 ({bias_t12:+.1f} C)")
+    if abs(bias_t_cut) > 2.5:
+        reasons.append(f"large NWP bias at cutoff ({bias_t_cut:+.1f} C)")
 
     return {
         "date":           target_date.strftime("%Y-%m-%d"),
-        "temp_at_12:00":  round(sf["t12"], 1),
+        "cutoff":         f"{ch:02d}:{cm:02d}",
+        "temp_at_cut":    round(sf["t_cut"], 1),
         "nwp_tmax":       round(nf["nwp_tmax"], 1),
-        "nwp_t12":        round(nf["nwp_t12"], 1),
-        "nwp_bias_at_12": round(bias_t12, 2),
+        "nwp_t_cut":      round(nf["nwp_t_cut"], 1),
+        "nwp_bias_at_12": round(bias_t_cut, 2),   # key kept for frontend compat
         "nwp_cloud_std":  round(cloud_std, 1),
-        "mu":             round(mu),  # integer prediction (23.2 -> 23)
+        "mu":             round(mu),
         "sigma":          round(sigma, 3),
         "ci_low_95":      ci_low,
         "ci_high_95":     ci_high,
@@ -826,7 +843,7 @@ def evaluate_calibration(model: PostProcessMOS,
 # 11.  SAVE / LOAD
 # ===========================================================================
 
-def save_model(model, scaler_mean, scaler_std, conformal_q, path=MODEL_SAVE):
+def save_model(model, scaler_mean, scaler_std, conformal_q, path=MODEL_SAVE, cutoff=(12, 0)):
     torch.save({
         "model_state":      model.state_dict(),
         "scaler_mean":      scaler_mean,
@@ -835,12 +852,13 @@ def save_model(model, scaler_mean, scaler_std, conformal_q, path=MODEL_SAVE):
         "feature_names":    FEATURE_NAMES,
         "n_features":       N_FEATURES,
         "sigma_skip_idxs":  model.sigma_skip_idxs,
+        "cutoff":           cutoff,
     }, path)
     print(f"Model saved to {path}")
 
 
 def load_model(path=MODEL_SAVE) -> tuple:
-    """Returns (model, scaler_mean, scaler_std, conformal_q)."""
+    """Returns (model, scaler_mean, scaler_std, conformal_q, cutoff)."""
     if not Path(path).exists():
         raise FileNotFoundError(f"No saved model at {path}. Run 'python postprocess_model.py train' first.")
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
@@ -848,59 +866,80 @@ def load_model(path=MODEL_SAVE) -> tuple:
                            sigma_skip_idxs=ckpt.get("sigma_skip_idxs", SIGMA_SKIP_IDXS))
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    return model, ckpt["scaler_mean"], ckpt["scaler_std"], ckpt["conformal_q"]
+    return model, ckpt["scaler_mean"], ckpt["scaler_std"], ckpt["conformal_q"], ckpt.get("cutoff", (12, 0))
 
 
 # ===========================================================================
 # 12.  CLI
 # ===========================================================================
 
-def cmd_train():
-    print("=" * 52)
-    print("  MOS Post-Processing Model -- Training")
-    print("=" * 52)
+def _train_one(cutoff: tuple) -> None:
+    """Train, calibrate, and save one MOS model for the given cutoff time."""
+    h, m = cutoff
+    tag  = cutoff_tag(h, m)
+    print(f"\n{'='*52}")
+    print(f"  MOS {h:02d}:{m:02d}  (cutoff {tag})")
+    print(f"{'='*52}")
 
-    X, y, dates = build_dataset()
+    X, y, dates = build_dataset(cutoff=cutoff)
     n = len(X)
     if n < 50:
-        sys.exit("Not enough data to train (need >= 50 days).")
+        print(f"  Skipping: only {n} days (need >= 50).")
+        return
 
-    # Chronological split: train / val / calibration
     n_cal  = max(int(n * CALIB_RATIO), 20)
     n_rest = n - n_cal
     n_val  = max(int(n_rest * (VAL_RATIO / (TRAIN_RATIO + VAL_RATIO))), 10)
     n_tr   = n_rest - n_val
 
-    X_tr,  y_tr   = X[:n_tr],              y[:n_tr]
-    X_va,  y_va   = X[n_tr:n_tr+n_val],   y[n_tr:n_tr+n_val]
-    X_cal, y_cal  = X[n_tr+n_val:],        y[n_tr+n_val:]
+    X_tr,  y_tr   = X[:n_tr],             y[:n_tr]
+    X_va,  y_va   = X[n_tr:n_tr+n_val],  y[n_tr:n_tr+n_val]
+    X_cal, y_cal  = X[n_tr+n_val:],       y[n_tr+n_val:]
 
-    print(f"\n  Split: train={n_tr}  val={n_val}  calibration={n_cal}")
-    print(f"  Training dates: {dates[0]} -> {dates[n_tr-1]}")
-    print(f"  Val dates:      {dates[n_tr]} -> {dates[n_tr+n_val-1]}")
-    print(f"  Calib dates:    {dates[n_tr+n_val]} -> {dates[-1]}\n")
+    print(f"  Split: train={n_tr}  val={n_val}  calibration={n_cal}")
+    print(f"  Dates: {dates[0]} -> {dates[-1]}")
 
-    # Fit scaler on training data only (no leakage)
     scaler_mean, scaler_std = fit_scaler(X_tr)
     X_tr_s  = scale(X_tr,  scaler_mean, scaler_std)
     X_va_s  = scale(X_va,  scaler_mean, scaler_std)
     X_cal_s = scale(X_cal, scaler_mean, scaler_std)
 
-    print("  Training ")
     model = train(X_tr_s, y_tr, X_va_s, y_va)
+    q     = conformal_calibrate(model, X_cal_s, y_cal)
 
-    print("\n  Calibrating (conformal) ")
-    q = conformal_calibrate(model, X_cal_s, y_cal)
+    evaluate_calibration(model, X_va_s,  y_va,  q, f"Val  [{tag}]")
+    evaluate_calibration(model, X_cal_s, y_cal, q, f"Cal  [{tag}]")
 
-    evaluate_calibration(model, X_tr_s,  y_tr,  q, "Training set")
-    evaluate_calibration(model, X_va_s,  y_va,  q, "Validation set")
-    evaluate_calibration(model, X_cal_s, y_cal, q, "Calibration set")
-
-    save_model(model, scaler_mean, scaler_std, q)
+    save_model(model, scaler_mean, scaler_std, q,
+               path=model_path_for(h, m), cutoff=cutoff)
 
 
-def cmd_predict(date_str: str | None = None, station_file: str | None = None):
-    model, s_mean, s_std, q = load_model()
+def cmd_train():
+    print("=" * 52)
+    print("  MOS Post-Processing — Training all 10 cutoff models")
+    print(f"  Cutoffs: {', '.join(f'{h:02d}:{m:02d}' for h, m in CUTOFFS)}")
+    print("=" * 52)
+    for cutoff in CUTOFFS:
+        _train_one(cutoff)
+    print(f"\n{'='*52}")
+    print("  All models trained.")
+    print(f"{'='*52}\n")
+
+
+def cmd_predict(date_str: str | None = None, station_file: str | None = None,
+                cutoff_tag_str: str | None = None):
+    # Pick cutoff: explicit arg, or latest available for current time
+    if cutoff_tag_str:
+        h, m = int(cutoff_tag_str[:2]), int(cutoff_tag_str[2:])
+        cutoff = (h, m)
+    else:
+        now_hm = (datetime.now().hour, datetime.now().minute)
+        valid  = [(h, m) for h, m in CUTOFFS if (h, m) <= now_hm]
+        cutoff = max(valid) if valid else CUTOFFS[-1]
+
+    ch, cm = cutoff
+    path = model_path_for(ch, cm)
+    model, s_mean, s_std, q, _ = load_model(path=str(path))
 
     # Determine target date
     if date_str:
@@ -912,40 +951,34 @@ def cmd_predict(date_str: str | None = None, station_file: str | None = None):
         target = date.today()
 
     target_iso = target.strftime("%Y-%m-%d")
-    print(f"\nPredicting for {target_iso} ")
+    print(f"\nPredicting for {target_iso}  [cutoff {ch:02d}:{cm:02d}]")
 
     # Load station data
     station = load_station(extra_file=station_file)
     if target not in station:
-        if target > date.today():
-            sys.exit(
-                f"Cannot predict {target_iso}: this model requires station readings "
-                f"up to 12:00 on the target day. Run again after 12:00 on that date."
-            )
         sys.exit(
             f"No station data found for {target_iso}. "
-            f"Ensure the date is covered by a JSON file in {TRAINING_DATA_DIR}."
+            f"Ensure the date is covered by a CSV file in {TRAINING_DATA_DIR}."
         )
 
-    # NWP: use ERA5 cache if the date is covered (up to NWP_END), else live forecast
+    # NWP: ERA5 cache or live forecast
     nwp_end_date = date.fromisoformat(NWP_END)
     if target <= nwp_end_date:
         nwp_raw = load_or_fetch_nwp()
-        # If the cached archive doesn't have this date, fall through to live
-        nwp_daily_check = nwp_features_from_response(nwp_raw)
+        nwp_daily_check = nwp_features_from_response(nwp_raw, cutoff_hour=ch)
         if target_iso not in nwp_daily_check:
-            print(f"  Date not in ERA5 cache, fetching live forecast for {target_iso} ...")
+            print(f"  Date not in ERA5 cache, fetching live forecast ...")
             nwp_raw = fetch_forecast_today(target_iso)
     else:
         print(f"  Fetching live NWP forecast for {target_iso} ...")
         nwp_raw = fetch_forecast_today(target_iso)
 
-    nwp_daily = nwp_features_from_response(nwp_raw)
+    nwp_daily = nwp_features_from_response(nwp_raw, cutoff_hour=ch)
     if target_iso not in nwp_daily:
         sys.exit(f"NWP data not available for {target_iso}.")
 
     result = predict(model, s_mean, s_std, q,
-                     station[target], nwp_daily[target_iso], target)
+                     station[target], nwp_daily[target_iso], target, cutoff=cutoff)
 
     if "error" in result:
         print(f"  Error: {result['error']}")
@@ -954,10 +987,11 @@ def cmd_predict(date_str: str | None = None, station_file: str | None = None):
     conf_sym = {"HIGH": "***", "MEDIUM": "**", "LOW": "!"}[result["confidence"]]
     print(f"\n{'='*52}")
     print(f"  Date              : {result['date']}")
-    print(f"  Station at 12:00  : {result['temp_at_12:00']} C")
+    print(f"  Cutoff            : {result['cutoff']}")
+    print(f"  Station at cutoff : {result['temp_at_cut']} C")
     print(f"  NWP forecast max  : {result['nwp_tmax']} C")
-    print(f"  NWP at 12:00      : {result['nwp_t12']} C")
-    print(f"  NWP bias at 12:00 : {result['nwp_bias_at_12']:+.2f} C")
+    print(f"  NWP at cutoff     : {result['nwp_t_cut']} C")
+    print(f"  NWP bias at cut   : {result['nwp_bias_at_12']:+.2f} C")
     print(f"  NWP cloud variab. : {result['nwp_cloud_std']:.1f}%")
     print(f"{'='*52}")
     print(f"  Predicted max (mu): {result['mu']} C")
@@ -971,20 +1005,32 @@ def cmd_predict(date_str: str | None = None, station_file: str | None = None):
 
 
 def cmd_evaluate():
-    model, s_mean, s_std, q = load_model()
-    X, y, dates = build_dataset()
-    Xs = scale(X, s_mean, s_std)
-    evaluate_calibration(model, Xs, y, q, "Full dataset (all splits)")
+    for cutoff in CUTOFFS:
+        h, m = cutoff
+        path = model_path_for(h, m)
+        if not path.exists():
+            print(f"  {h:02d}:{m:02d} — model not found, skipping")
+            continue
+        model, s_mean, s_std, q, _ = load_model(path=str(path))
+        X, y, _ = build_dataset(cutoff=cutoff)
+        Xs = scale(X, s_mean, s_std)
+        evaluate_calibration(model, Xs, y, q, f"Cutoff {h:02d}:{m:02d}")
 
 
-def cmd_backtest():
+def cmd_backtest(cutoff_tag_str: str | None = None):
     """
-    Per-day backtest table across all data splits.
-    Training set rows are marked [TR], validation [VA], calibration [CA].
-    Note: [TR] rows are in-sample (optimistic) -- trust [VA]/[CA] for real accuracy.
+    Per-day backtest table for one cutoff model (default: 13:50).
+    Usage: python postprocess_model.py backtest [HHMM]
     """
-    model, s_mean, s_std, q = load_model()
-    X, y, dates = build_dataset()
+    if cutoff_tag_str:
+        h, m = int(cutoff_tag_str[:2]), int(cutoff_tag_str[2:])
+        cutoff = (h, m)
+    else:
+        cutoff = CUTOFFS[0]   # default: 13:50
+        h, m = cutoff
+    path = model_path_for(h, m)
+    model, s_mean, s_std, q, _ = load_model(path=str(path))
+    X, y, dates = build_dataset(cutoff=cutoff)
     Xs = scale(X, s_mean, s_std)
 
     # Reconstruct split boundaries (same logic as cmd_train)
@@ -1061,6 +1107,111 @@ def cmd_backtest():
     print(f"{'='*72}\n")
 
 
+def cmd_backtest3(n_days: int = 3):
+    """
+    Cross-model backtest: last N days x all 10 cutoff models.
+    For each day shows actual max and each model's prediction + error.
+    """
+    station = load_station()
+    nwp_end = date.fromisoformat(NWP_END)
+
+    # Pick last N complete days (have obs on both sides of at least the earliest cutoff)
+    earliest_cut = CUTOFFS[-1]   # (10, 50)
+    complete_days = [
+        d for d, recs in station.items()
+        if any((r["dt"].hour, r["dt"].minute) > earliest_cut for r in recs)
+    ]
+    days = sorted(complete_days)[-n_days:]
+
+    if not days:
+        print("Not enough complete days found.")
+        return
+
+    # Load all available models
+    bundles = {}
+    for h, m in CUTOFFS:
+        p = model_path_for(h, m)
+        if p.exists():
+            bundles[(h, m)] = load_model(path=str(p))
+
+    if not bundles:
+        print("No trained models found. Run: python postprocess_model.py train")
+        return
+
+    # Pre-fetch NWP for each day (ERA5 or live forecast)
+    nwp_cache_raw = load_or_fetch_nwp() if any(d <= nwp_end for d in days) else None
+    live_cache: dict[str, dict] = {}
+
+    def get_nwp_raw(d: date) -> dict:
+        if d <= nwp_end and nwp_cache_raw:
+            return nwp_cache_raw
+        ds = d.strftime("%Y-%m-%d")
+        if ds not in live_cache:
+            print(f"  Fetching live NWP for {ds} ...")
+            live_cache[ds] = fetch_forecast_today(ds)
+        return live_cache[ds]
+
+    # Collect all results first
+    cutoff_labels = [f"{h:02d}:{m:02d}" for h, m in CUTOFFS]
+    rows = []   # list of dicts per day
+
+    for day in days:
+        recs   = station[day]
+        actual = round(max(r["TD"] for r in recs))
+        ds     = day.strftime("%Y-%m-%d")
+        nwp_raw = get_nwp_raw(day)
+        row = {"date": ds, "actual": actual, "t_cut": {}, "pred": {}}
+
+        for h, m in CUTOFFS:
+            lbl = f"{h:02d}:{m:02d}"
+            if (h, m) not in bundles:
+                continue
+            model, s_mean, s_std, q, cutoff = bundles[(h, m)]
+            nwp_daily = nwp_features_from_response(nwp_raw, cutoff_hour=h)
+            if ds not in nwp_daily:
+                continue
+            res = predict(model, s_mean, s_std, q,
+                          recs, nwp_daily[ds], day, cutoff=(h, m))
+            if "error" not in res:
+                row["t_cut"][lbl] = res["temp_at_cut"]
+                row["pred"][lbl]  = res["mu"]
+        rows.append(row)
+
+    # --- t_cut table ---
+    col_w = 7
+    date_w = 12
+    header = f"  {'Date':<{date_w}}" + "".join(f"{lbl:>{col_w}}" for lbl in cutoff_labels) + f"  {'Actual':>6}"
+    sep    = "  " + "-" * (len(header) - 2)
+
+    print(f"\n  Observed temperature at each model's cutoff time")
+    print(sep)
+    print(header)
+    print(sep)
+    for row in rows:
+        line = f"  {row['date']:<{date_w}}"
+        for lbl in cutoff_labels:
+            v = row["t_cut"].get(lbl)
+            line += f"{v:>{col_w}.1f}" if v is not None else f"{'--':>{col_w}}"
+        line += f"  {row['actual']:>6}"
+        print(line)
+    print(sep)
+
+    # --- pred table ---
+    print(f"\n  Model prediction (mu) at each cutoff")
+    print(sep)
+    print(header)
+    print(sep)
+    for row in rows:
+        line = f"  {row['date']:<{date_w}}"
+        for lbl in cutoff_labels:
+            v = row["pred"].get(lbl)
+            line += f"{v:>{col_w}}" if v is not None else f"{'--':>{col_w}}"
+        line += f"  {row['actual']:>6}"
+        print(line)
+    print(sep)
+    print()
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "predict"
     if cmd == "train":
@@ -1078,11 +1229,22 @@ def main():
             else:
                 date_str = args[i]
                 i += 1
-        cmd_predict(date_str, station_file)
+        cutoff_str = None
+        remaining = []
+        for a in args:
+            if len(a) == 4 and a.isdigit():
+                cutoff_str = a
+            else:
+                remaining.append(a)
+        cmd_predict(date_str, station_file, cutoff_tag_str=cutoff_str)
     elif cmd == "evaluate":
         cmd_evaluate()
     elif cmd == "backtest":
-        cmd_backtest()
+        cutoff_str = sys.argv[2] if len(sys.argv) > 2 else None
+        cmd_backtest(cutoff_str)
+    elif cmd == "backtest3":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+        cmd_backtest3(n)
     else:
         print(__doc__)
         sys.exit(1)
